@@ -1,0 +1,2214 @@
+---
+title: "PROJET DE PROVISIONNEMENT"
+author: "Dimitri MEKONTSO"
+date: "2025-11-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set
+library(readxl)
+library(ChainLadder)
+library(ggplot2)
+library(dplyr)
+require(plotly)
+library(ggtext)
+require(grid)
+library(plotly)
+library(gridExtra)  # Pour grid.arrange
+require(nortest)
+library(lmtest)
+require(moments)
+library(tseries)
+library(FinTS)
+library(scales)
+
+```
+
+
+```{r}
+
+
+theme_custom <- theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray85"),
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA),
+    strip.text = element_text(size = 14, face = "bold", color = "white"),
+    strip.background = element_rect(fill = "#006400", color = "black"),
+    plot.margin = margin(5,5,5,5)
+  )
+#006400
+```
+
+
+
+
+# Partie I: IMPORTATION ET ANALYSE DES DONNÉES 
+
+## IMPORTATION DE LA BASE DE DONNÉES 
+
+```{r}
+Triangle <- read_excel("Triangle.xlsx",skip=1)
+head(Triangle)
+```
+
+## Extraire les années et les mettre comme noms de lignes
+
+```{r}
+annees <- Triangle[[1]]
+triangle_matrice <- as.matrix(Triangle[, -1])  # Exclure la colonne Année
+rownames(triangle_matrice)=annees
+triangle_matrice
+```
+
+## Créer le triangle ChainLadder
+```{r}
+mon_triangle <- as.triangle(triangle_matrice)
+mon_triangle 
+```
+
+## Analyse de l'écoulement des paiments
+
+```{r}
+df=as.data.frame(mon_triangle)
+colnames(df)
+```
+
+```{r}
+df$var <- "Écoulement~des~paiements~par~année~de~survenance"
+# Créer le graphique
+p<-ggplot(df, aes(x = as.factor(dev), y = value/1000000, 
+                    color = as.factor(origin), group = origin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Année de développement",
+    y = "Paiement cumulé (en millions)",
+    color = "Année de\nsurvenance"
+  ) +
+  theme_custom +
+  theme(
+    legend.background = element_rect(
+      fill = "white",
+      color = "black",      # Couleur du bord
+      linewidth = 0.5         # Épaisseur du bord
+    ),
+    legend.box.background = element_rect(
+      color = "black",
+      linewidth = 1
+    ),
+    legend.margin = margin(6, 6, 6, 6)  # Marges internes
+  )
+p
+```
+
+Ce graphique illustre l'écoulement cumulé des paiements de sinistres, regroupés par leur année de survenance (cohortes de 2015 à 2024) et mesurés selon leur année de développement. Chaque ligne représente une cohorte et montre la progression monotone des paiements. Le point le plus récent sur chaque courbe indique l'état actuel des règlements.
+
+**Interprétation** : 
+Ce graphique confirme une branche à queue moyenne avec un règlement rapide sur les 4 à 5 premières années. Nous observons une forte croissance structurelle/inflation, car les cohortes récentes sont systématiquement plus élevées. Les points clés de volatilité sont le millésime 2020 très bas (effet COVID) et les années 2016-2017 anormalement hautes.
+
+
+## Evolution des paiments des sinstres pour chaque survenances 
+
+```{r}
+triangl_decumul=cum2incr(mon_triangle ) # on décumul le triangle
+triangle_matrix <- as.matrix(triangl_decumul)
+# Calcul de la somme des diagonales (montants payés par année de survenance)
+n <- nrow(triangle_matrix)
+paid_by_accident_year <- numeric(n)
+for (i in 1:n) {
+  # Diagonale = somme des valeurs (i + j - 1) constantes
+  diag_values <- sapply(1:ncol(triangle_matrix), function(j) {
+    row <- i - j + 1
+    if (row > 0 && row <= n) triangle_matrix[row, j] else NA
+  })
+  paid_by_accident_year[i] <- sum(diag_values, na.rm = TRUE)
+}
+#Résultat final
+result<-data.frame(
+  origin =unique(df$origin),
+  paid_by_accident_year = paid_by_accident_year
+)
+result
+```
+
+
+
+```{r}
+#Création du graphique
+result$var <- "Montants~de~sinistres~payés~par~année~de~survenance"
+p=ggplot(result, aes(x = factor(origin), y = paid_by_accident_year/1e6)) +
+  geom_col(fill = "#006400") +
+  geom_text(aes(label = format(round(paid_by_accident_year/1e6, 2), big.mark = " ")), 
+            vjust = -0.3, size = 3.5) +  facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Année de survenance",
+    y = "Somme totale des paiements(En Millions)"
+  )+
+  theme_custom
+p
+```
+
+**Interprétation:**
+
+
+
+# Partie II: Estimation des PSAP par le modèle de christofides
+
+## Presentation de la méthode Log normal de Christofides.
+
+Elle suppose que les logarithmes des paiements suivent une loi normale de paramètres $\alpha_i$+$\beta_j$ et $\sigma^2$, $\alpha_i$ l'éffet de l'année d'origine $i$  et $\beta_j$ celui de l'années de développement $j$. on met le problème sur forme matricielle et la solution est identique à celle d'un modèle de regression linéaire. L'estimateur MCO est sans biais et est le "meilleur".
+
+Le modèle s'écrit: 
+$$Y_{i,j}=ln(X_{i,j})=\alpha_i+\beta_j+\epsilon_{i,j}$$
+
+
+
+Il faut traviller sur le triangle décumulé.
+
+## Triangle décumulé.
+
+```{r}
+triangl_decumul=cum2incr(mon_triangle )
+df=as.data.frame(triangl_decumul)
+df_obs <- subset(df, ! is.na(value)) # on utilise les données du triangles supérieure 
+```
+
+## Mise en oeuvre du modèle
+
+```{r}
+# Transformation log-normale
+df_obs$log_value <- log(df_obs$value)
+df_obs$origin=as.factor(df_obs$origin)
+df_obs$dev=as.factor(df_obs$dev)
+
+# Ajustement du modèle log-normal de Christofides
+modele_christofides <- lm(log_value ~ origin + dev, data = df_obs)
+summary(modele_christofides)
+```
+
+Le modèle montre une bonne qualité d'ajustement globale. Le $R^2$ multiple est de 0.821, ce qui signifie que 82.1% de la variance des logarithmes des paiements cumulés est expliquée par les effets d'origine et de développement. Le test F ($p$-value $1.258\text{e-}08$) confirme que le modèle est globalement significatif.
+
+**Interprétation des Effets**
+La cohorte d'origine 2015 et l'année de développement 1 servent de référence et ne sont pas incluses (leur coefficient est implicitement 0, et l'Intercept $12.52$ est la valeur $\ln(X_{2015,1})$ estimée).
+
+- Effet d'Origine ($\alpha_i$) : Les coefficients $\alpha_i$ (pour 2016 à 2024) sont majoritairement positifs, indiquant que la plupart des cohortes récentes (sauf 2018) ont, en moyenne, des niveaux de paiements cumulés plus élevés que la cohorte de référence 2015.L'effet est significatif pour 2016 ($0.361^*$) et 2022 ($0.480\text{.}$). L'effet élevé de 2022 reflète l'inflation et/ou la croissance du portefeuille observées.
+
+- Effet de Développement ($\beta_j$) : Les effets de développement (colonnes 2 à 10) sont les plus fortement significatifs (p-values très faibles), ce qui est attendu : le temps est le facteur principal de la croissance des paiements cumulés. Les coefficients sont positifs jusqu'à l'année 5, avec des valeurs importantes pour les années 2, 3 et 4 ($0.911$ à $0.965$ en log), marquant la période où la croissance est maximale.La croissance ralentit et devient presque nulle en année 6 (coefficient $-0.005$) et diminue ensuite. L'effet de l'année 10 est le plus négatif ($-1.393^{***}$), marquant la fin de la période d'observation et une faible croissance résiduelle par rapport à l'année de référence 1.
+
+
+
+
+## Validation des hypothèses du modèle
+
+Valider les hypothèses du modèle revient à valider les hypothèses faites sur les résidus.
+
+
+**1. Normalité des Résidus**
+
+Nous utilisons le test de Shapiro-Wilk et le graphique Q-Q plot pour vérifier si les résidus suivent une loi normale.
+**Interprétation :** Si la $p$-value de Shapiro-Wilk est supérieure à 0.05, nous ne rejettons pas l'hypothèse de normalité.
+
+```{r}
+residus <- residuals(modele_christofides)
+# Test de Shapiro-Wilk (pour la normalité)
+shapiro.test(residus)
+# Graphique Q-Q plot (pour visualiser la normalité)
+qqnorm(residus)
+qqline(residus, col = "red")
+```
+
+Le graphique montre des quantiles qui suivent la droite de Henri. Nous notons toutefois qu'ils  s'écartent beaucoup de la distribution normale au niveau des extrêmes. Ceci laisse à supposer que les résidus ne sont pas normalement distribués. Toutefois, le tests de Shapiro renvoie une p-valeur > 0.05. Donc, nous concluons que les résidus sont normalement distribués.
+
+
+**2. Homoscédasticité (Variance Constante)**
+
+Nous utilisons le test de Breusch-Pagan et un graphique des résidus vs. les valeurs ajustées.
+
+**Interprétation :** Si la $p$-value de Breusch-Pagan est supérieure à 0.05, nous acceptons l'hypothèse d'homoscédasticité. Graphiquement, les points doivent être dispersés de manière aléatoire et uniforme autour de la ligne horizontale.
+
+```{r}
+# Test de Breusch-Pagan (pour l'homoscédasticité)
+bptest(modele_christofides)
+# Graphique de dispersion des résidus (vérification visuelle)
+plot(fitted(modele_christofides), residus,
+     xlab = "Valeurs Ajustées",
+     ylab = "Résidus",
+     main = "Résidus vs. Valeurs Ajustées")
+abline(h = 0, col = "red")
+```
+Nous notons des points dispersés de manière aléatoire autour de l'axe $x=0$. Par ailleurs, la p-valeur étant > 5%, nous concluons que les résidus sont homoscédastiques. 
+
+3. Indépendance des Erreurs (Autocorrélation)
+Le test de Durbin-Watson permet de détecter l'autocorrélation d'ordre 1 dans les résidus, ce qui est pertinent si l'ordre des données dans le data.frame reflète un ordre temporel.
+
+**Interprétation :** La statistique de Durbin-Watson (DW) doit être proche de 2 (valeurs proches de 0 ou 4 indiquent une autocorrélation). Si la $p$-value est supérieure à 0.05, nous ne rejettons pas l'hypothèse d'indépendance.
+
+```{r}
+# Nécessite le package 'lmtest'
+library(lmtest)
+# Test de Durbin-Watson
+dwtest(modele_christofides)
+```
+Nous avons une statistique de Durbin-Watson proche de 2. Par ailleurs, nous notons que la p-valeurs est supérieure à 5%. Donc, nos résidus ne sont pas indépendants.
+
+4. Multicollinéarité
+Nous utilisons les Facteurs d'Inflation de la Variance (VIF) pour vérifier la dépendance entre les variables explicatives (origin et dev).
+
+**Interprétation :** Des valeurs de VIF inférieures à 5 ou 10 sont généralement considérées comme acceptables. Des VIF élevés indiquent que la forte corrélation entre les facteurs rend les estimations des coefficients instables.
+
+```{r}
+# Nécessite le package 'car'
+# install.packages("car")
+library(car)
+# Calcul des VIF
+vif(modele_christofides)
+```
+
+Nous allons des facteurs d'inflation de la variance sont tous inférieurs à 5%, nous concluons qu'il n'y a pas de problème de multicollinéarité significatif entre les variables explicatives.
+
+**Conclusion:** au ragarde de l'analyse des resultats des tests sur les résidus, on valide le modèle log-normale.
+
+**Synthèse des résultats et graphiques pour le rapport:**
+
+####------------------------------------
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+library(tseries)
+library(nortest)
+library(lmtest)
+library(FinTS)
+library(moments)
+
+# Récupérer les résidus
+residus <- residuals(modele_christofides)
+
+# ============================================================
+# CHARTE GRAPHIQUE AVEC #006400 (vert foncé)
+# ============================================================
+
+# Définir les couleurs avec #006400 comme couleur principale
+col_principal <- "#006400"  # Vert foncé
+col_secondaire <- "#228B22"  # Vert forestier (plus clair)
+col_ligne <- "black"
+col_rouge <- "red"          # Pour les lignes de référence
+
+# Votre thème personnalisé EXACT
+theme_custom <- theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray85"),
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA),
+    strip.text = element_text(size = 14, face = "bold", color = "white"),
+    strip.background = element_rect(fill = "#006400", color = "black"),
+    plot.margin = margin(5,5,5,5),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+# ============================================================
+# CALCUL DE TOUS LES TESTS
+# ============================================================
+
+# Tests pour Résidus vs Temps
+lb_test <- Box.test(residus, lag = 20, type = "Ljung-Box")
+bp_test <- bptest(lm(residus ~ seq_along(residus)))
+
+# Tests de normalité
+if (length(residus) <= 5000) {
+  sw_test <- shapiro.test(residus)
+  test_name <- "Shapiro-Wilk"
+  p_val_sw <- sw_test$p.value
+} else {
+  ad_test <- ad.test(residus)
+  test_name <- "Anderson-Darling"
+  p_val_sw <- ad_test$p.value
+}
+
+jb_test <- jarque.bera.test(residus)
+ks_test <- ks.test(residus, "pnorm", 
+                   mean = mean(residus, na.rm = TRUE), 
+                   sd = sd(residus, na.rm = TRUE))
+
+# Tests ACF
+lb_test_acf <- Box.test(residus, lag = min(20, length(residus)/5), type = "Ljung-Box")
+
+# Tests PACF et McLeod-Li
+lb_test_sq <- Box.test(residus^2, lag = 20, type = "Ljung-Box")
+
+# Test ARCH
+arch_test <- tryCatch({
+  ArchTest(residus, lags = 12)
+}, error = function(e) {
+  list(p.value = NA, statistic = NA)
+})
+
+# Limite de confiance pour ACF/PACF
+ci <- 1.96 / sqrt(length(residus))
+
+# ============================================================
+# CRÉATION DES GRAPHIQUES AVEC LE BON FORMAT DE TITRES
+# ============================================================
+
+# 1. Résidus vs Temps
+df_residus <- data.frame(
+  temps = 1:length(residus),
+  residus = as.numeric(residus)
+)
+
+p1 <- ggplot(df_residus, aes(x = temps, y = residus)) +
+  geom_line(color = col_principal, linewidth = 0.8) +
+  geom_point(color = col_principal, size = 1.5, alpha = 0.6) +
+  geom_hline(yintercept = 0, color = col_rouge, linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = c(-2, 2) * sd(residus, na.rm = TRUE), 
+             color = col_secondaire, linetype = "dotted", linewidth = 0.8) +
+  annotate("text", x = length(residus) * 0.05, 
+           y = max(residus, na.rm = TRUE) * 0.9,
+           label = sprintf("Ljung-Box: p = %.4f\nBreusch-Pagan: p = %.4f", 
+                           lb_test$p.value, bp_test$p.value),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "Résidus vs Temps",
+       x = "Temps",
+       y = "Résidus") +
+  theme_custom
+
+# 2. QQ-Plot
+df_qq <- data.frame(
+  theorique = qqnorm(residus, plot.it = FALSE)$x,
+  empirique = qqnorm(residus, plot.it = FALSE)$y
+)
+
+p2 <- ggplot(df_qq, aes(x = theorique, y = empirique)) +
+  geom_point(color = col_principal, size = 2, alpha = 0.6) +
+  geom_abline(intercept = mean(residus, na.rm = TRUE), 
+              slope = sd(residus, na.rm = TRUE),
+              color = col_rouge, linewidth = 1) +
+  annotate("text", x = min(df_qq$theorique), 
+           y = max(df_qq$empirique) * 0.9,
+           label = sprintf("Shapiro-Wilk: p = %.4f\nJarque-Bera: p = %.4f", 
+                           p_val_sw, jb_test$p.value),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "Q-Q Plot",
+       x = "Quantiles théoriques",
+       y = "Quantiles empiriques") +
+  theme_custom
+
+# 3. Histogramme
+p3 <- ggplot(df_residus, aes(x = residus)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 30, 
+                 fill = col_principal, 
+                 color = "black",
+                 alpha = 0.6) +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(residus, na.rm = TRUE), 
+                            sd = sd(residus, na.rm = TRUE)),
+                color = col_rouge, linewidth = 1.2) +
+  annotate("text", x = max(residus, na.rm = TRUE) * 0.6, 
+           y = max(hist(residus, plot = FALSE)$density) * 0.9,
+           label = sprintf("Jarque-Bera: p = %.4f\nSkewness: %.4f\nKurtosis: %.4f", 
+                           jb_test$p.value,
+                           skewness(residus, na.rm = TRUE),
+                           kurtosis(residus, na.rm = TRUE)),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "Histogramme des résidus",
+       x = "Résidus",
+       y = "Densité") +
+  theme_custom
+
+# 4. ACF des résidus
+acf_result <- acf(residus, plot = FALSE)
+df_acf <- data.frame(
+  lag = acf_result$lag[-1],
+  acf = acf_result$acf[-1]
+)
+
+p4 <- ggplot(df_acf, aes(x = lag, y = acf)) +
+  geom_hline(yintercept = 0, color = col_ligne, linewidth = 0.5) +
+  geom_hline(yintercept = ci, color = col_secondaire, linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = -ci, color = col_secondaire, linetype = "dashed", linewidth = 0.8) +
+  geom_segment(aes(xend = lag, yend = 0), 
+               color = col_principal, linewidth = 1) +
+  geom_point(color = col_principal, size = 2) +
+  annotate("text", x = max(df_acf$lag) * 0.6, 
+           y = max(df_acf$acf) * 0.8,
+           label = sprintf("Ljung-Box: p = %.4f", lb_test_acf$p.value),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "ACF des résidus",
+       x = "Lag",
+       y = "ACF") +
+  theme_custom
+
+# 5. PACF des résidus
+pacf_result <- pacf(residus, plot = FALSE)
+df_pacf <- data.frame(
+  lag = pacf_result$lag,
+  pacf = pacf_result$acf
+)
+
+p5 <- ggplot(df_pacf, aes(x = lag, y = pacf)) +
+  geom_hline(yintercept = 0, color = col_ligne, linewidth = 0.5) +
+  geom_hline(yintercept = ci, color = col_secondaire, linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = -ci, color = col_secondaire, linetype = "dashed", linewidth = 0.8) +
+  geom_segment(aes(xend = lag, yend = 0), 
+               color = col_principal, linewidth = 1) +
+  geom_point(color = col_principal, size = 2) +
+  annotate("text", x = max(df_pacf$lag) * 0.6, 
+           y = max(df_pacf$pacf, na.rm = TRUE) * 0.8,
+           label = sprintf("McLeod-Li: p = %.4f", lb_test_sq$p.value),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "PACF des résidus",
+       x = "Lag",
+       y = "PACF") +
+  theme_custom
+
+# 6. Résidus² vs Temps
+df_residus_sq <- data.frame(
+  temps = 1:length(residus),
+  residus_sq = as.numeric(residus)^2
+)
+
+p6 <- ggplot(df_residus_sq, aes(x = temps, y = residus_sq)) +
+  geom_line(color = col_principal, linewidth = 0.8, alpha = 0.6) +
+  geom_hline(yintercept = mean(residus^2, na.rm = TRUE), 
+             color = col_rouge, linetype = "dashed", linewidth = 1) +
+  annotate("text", x = length(residus) * 0.05, 
+           y = max(residus^2, na.rm = TRUE) * 0.9,
+           label = ifelse(!is.na(arch_test$p.value),
+                          sprintf("ARCH Test: p = %.4f", arch_test$p.value),
+                          "ARCH Test: N/A"),
+           hjust = 0, color = col_principal, fontface = "bold", size = 3.8,
+           lineheight = 0.9) +
+  labs(title = "Résidus² vs Temps",
+       x = "Temps",
+       y = "Résidus²") +
+  theme_custom
+
+# ============================================================
+# AFFICHAGE DES 6 GRAPHIQUES
+# ============================================================
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3, nrow = 2)
+
+# ============================================================
+# TABLEAU RÉCAPITULATIF
+# ============================================================
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════╗\n")
+cat("║               VALIDATION DES HYPOTHÈSES DU MODÈLE LINÉAIRE          ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════╝\n\n")
+
+# Fonction pour formater les résultats
+format_test_result <- function(test_name, p_value, statistic = NULL) {
+  symbol <- ifelse(p_value > 0.05, "✓", "✗")
+  if (!is.null(statistic)) {
+    return(sprintf("   %-25s: stat = %.4f, p = %.4f %s", 
+                   test_name, statistic, p_value, symbol))
+  } else {
+    return(sprintf("   %-25s: p = %.4f %s", test_name, p_value, symbol))
+  }
+}
+
+cat("1. TESTS DE NORMALITÉ\n")
+cat("   "); cat(rep("─", 60), sep = ""); cat("\n")
+cat(format_test_result("Shapiro-Wilk", p_val_sw, sw_test$statistic), "\n")
+cat(format_test_result("Jarque-Bera", jb_test$p.value, jb_test$statistic), "\n")
+cat(format_test_result("Kolmogorov-Smirnov", ks_test$p.value, ks_test$statistic), "\n")
+
+cat("\n2. TESTS D'INDÉPENDANCE\n")
+cat("   "); cat(rep("─", 60), sep = ""); cat("\n")
+for (lag in c(10, 20, 30)) {
+  if (lag < length(residus)) {
+    lb <- Box.test(residus, lag = lag, type = "Ljung-Box")
+    cat(format_test_result(sprintf("Ljung-Box (lag %d)", lag), 
+                           lb$p.value, lb$statistic), "\n")
+  }
+}
+
+cat("\n3. TESTS D'HOMOSCÉDASTICITÉ\n")
+cat("   "); cat(rep("─", 60), sep = ""); cat("\n")
+cat(format_test_result("Breusch-Pagan", bp_test$p.value, bp_test$statistic), "\n")
+if (!is.na(arch_test$p.value)) {
+  cat(format_test_result("ARCH Test (lag 12)", 
+                         arch_test$p.value, arch_test$statistic), "\n")
+}
+cat(format_test_result("McLeod-Li (résidus²)", 
+                       lb_test_sq$p.value, lb_test_sq$statistic), "\n")
+
+cat("\n4. STATISTIQUES DESCRIPTIVES\n")
+cat("   "); cat(rep("─", 60), sep = ""); cat("\n")
+stats_desc <- data.frame(
+  Statistique = c("Moyenne", "Écart-type", "Skewness", "Kurtosis", 
+                  "Minimum", "Maximum", "Q1", "Médiane", "Q3"),
+  Valeur = c(
+    mean(residus, na.rm = TRUE),
+    sd(residus, na.rm = TRUE),
+    skewness(residus, na.rm = TRUE),
+    kurtosis(residus, na.rm = TRUE),
+    min(residus, na.rm = TRUE),
+    max(residus, na.rm = TRUE),
+    quantile(residus, 0.25, na.rm = TRUE),
+    median(residus, na.rm = TRUE),
+    quantile(residus, 0.75, na.rm = TRUE)
+  )
+)
+
+for (i in 1:nrow(stats_desc)) {
+  cat(sprintf("   %-15s: % .6f\n", stats_desc$Statistique[i], stats_desc$Valeur[i]))
+}
+
+cat("\n5. SYNTHÈSE GLOBALE\n")
+cat("   "); cat(rep("─", 60), sep = ""); cat("\n")
+
+tests <- list(
+  "Normalité (Shapiro-Wilk)" = p_val_sw,
+  "Normalité (Jarque-Bera)" = jb_test$p.value,
+  "Indépendance (Ljung-Box lag 20)" = lb_test$p.value,
+  "Homoscédasticité (Breusch-Pagan)" = bp_test$p.value
+)
+
+if (!is.na(arch_test$p.value)) {
+  tests[["Homoscédasticité (ARCH)"]] <- arch_test$p.value
+}
+
+tests_passes <- sum(sapply(tests, function(p) p > 0.05))
+tests_total <- length(tests)
+pourcentage <- (tests_passes / tests_total) * 100
+
+cat(sprintf("   Tests réussis : %d/%d (%.1f%%)\n", tests_passes, tests_total, pourcentage))
+
+if (pourcentage >= 80) {
+  cat("   ✓ Le modèle est STATISTIQUEMENT VALIDE\n")
+} else if (pourcentage >= 60) {
+  cat("   ⚠ Le modèle est ACCEPTABLE\n")
+} else if (pourcentage >= 40) {
+  cat("   ⚠ Le modèle présente des DÉFAUTS\n")
+} else {
+  cat("   ✗ Le modèle N'EST PAS VALIDE\n")
+}
+
+cat("\n"); cat(rep("═", 70), sep = ""); cat("\n")
+
+# ============================================================
+# SAUVEGARDE DES GRAPHIQUES
+# ============================================================
+
+# Sauvegarde du diagnostic complet
+ggsave("diagnostic_residus_complet.png", 
+       arrangeGrob(p1, p2, p3, p4, p5, p6, ncol = 3, nrow = 2),
+       width = 16, height = 10, dpi = 300, bg = "white")
+
+cat("\n✓ Graphique sauvegardé : diagnostic_residus_complet.png\n")
+```
+
+
+
+####------------------------------------
+
+##  Calcul des provisions: il s'agit ici de prédire la partie inférieure du triangles des paiement decumulés
+### Prediction des valeurs futures
+
+Pour rappel, les paiements futurs prédits sont donnés par la formule :
+$$\hat{X}_{i,j} = \exp(\hat{\alpha}_i + \hat{\beta}_j + \tfrac{1}{2}\hat{\sigma}^2)$$
+```{r}
+# transformzation des variables en factor (pour pourvoir faire la prédiction)
+df$origin=as.factor(df$origin)
+df$dev=as.factor(df$dev)
+correction_term <- summary(modele_christofides)$sigma^2 / 2
+df_na <- subset(df, is.na(value))
+psap=sum(exp(predict(modele_christofides, newdata=df_na) + correction_term))
+
+BE_total <- psap
+psap# 18554909
+```
+
+
+```{r}
+df_na_predict=df_na
+df_na_predict$log_value=predict(modele_christofides, newdata=df_na)
+df_na_predict$value=exp(df_na_predict$log_value+correction_term)
+a=as.triangle(df_na_predict)
+a
+sum(a[!is.na(a)])
+```
+
+### Prédictions (important)
+
+```{r}
+## Construction du triangle incrémental complet 
+df_full <- df
+df_full$value[is.na(df_full$value)]<-df_na_predict$value #df_na_predict,df_na_predict
+
+tri_incr_complet <- as.triangle(df_full[, c("origin", "dev", "value")])
+tri_cum_complet  <- incr2cum(tri_incr_complet)
+
+## Ultimes (dernière colonne du triangle cumulé complété)
+ultimate <- tri_cum_complet[, ncol(tri_cum_complet)]
+
+## Paiements cumulés observés (à partir du triangle cumulé initial)
+latest_paid <- apply(mon_triangle, 1, function(x) tail(x[!is.na(x)], 1))
+
+## Provisions par année : R_hat_i = ultimate_i - latest_paid_i
+reserve_origin <- ultimate - latest_paid
+
+provisions_df <- data.frame(
+  origin      = as.numeric(rownames(tri_cum_complet)),
+  ultimate    = as.numeric(ultimate),
+  latest_paid = as.numeric(latest_paid),
+  reserve     = as.numeric(reserve_origin)
+)
+provisions_df$Taux_PSAP=provisions_df$reserve/provisions_df$ultimate
+
+## 4. Vérification rapide de la normalité des résidus sur les logs 
+
+residus = resid(modele_christofides)
+
+mu  = mean(residus)
+sig = sd(residus)
+
+hist(residus, , prob = TRUE, main = "Histogramme des résidus (log)", xlab = "Résidus")
+lines(density(residus), lwd = 2)
+
+# Ajouter la densité normale théorique
+curve(dnorm(x, mean = mu, sd = sig), add = TRUE, lwd = 2, lty = 2)
+qqnorm(residus); qqline(residus, col = "red")
+
+```
+
+
+
+
+## PSAP estimées par années de survenance.
+
+```{r}
+# ==================== PROPOSITION 1 : Barres avec dégradé (Total repositionné) ====================
+
+provisions_df$var_reserve <- "PSAP~par~année~de~survenance~(En~Millions)"
+
+moyenne_reserves<- mean(provisions_df$reserve, na.rm = TRUE)
+total_reserves<- sum(provisions_df$reserve, na.rm = TRUE)
+
+
+p1=ggplot(provisions_df, aes(x = as.factor(origin), y = reserve/1000000, fill = reserve/1000000)) +
+  geom_bar(stat = "identity", width = 0.75, color = "black", linewidth = 0.3) +
+  geom_hline(yintercept = moyenne_reserves/1000000, 
+             linetype = "dashed", color = "red", linewidth = 1) +
+  facet_grid(~var_reserve, labeller = label_parsed) +
+  geom_text(aes(label = format(round(reserve/1000000, 2), big.mark = " ")), 
+            vjust = -0.7, size = 3.8, color = "black", fontface = "bold") +
+  annotate("label", 
+           x = 2, y = moyenne_reserves/1000000, 
+           label = paste("Moyenne:", format(round(moyenne_reserves/1000000, 2), big.mark = " "), "M"),
+           fill = "white", color = "red", fontface = "bold",
+           size = 3.5, label.padding = unit(0.4, "lines")) +
+  annotate("label", 
+           x = length(unique(provisions_df$origin)) * 0.5,  # Positionné au milieu (45% de la largeur)
+           y = max(provisions_df$reserve/1000000, na.rm = TRUE) * 0.9,  # Au milieu en hauteur
+           label = paste("Total:", format(round(total_reserves/1000000, 2), big.mark = " "), "M €"), 
+           fill = "#006400", color = "white", fontface = "bold",
+           size = 4.5, label.padding = unit(0.5, "lines")) +
+  scale_fill_gradientn(
+    colors = c("#E8F5E9", "#A5D6A7", "#66BB6A", "#43A047", "#2E7D32", "#1B5E20"),
+    name = "PSAP\n(Millions)",
+    guide = guide_colorbar(
+      barwidth = 1.5,
+      barheight = 12,
+      frame.colour = "black",
+      frame.linewidth = 1
+    )
+  ) +
+  labs(
+    x = "Année de survenance",
+    y = "PSAP (en millions €)"
+  ) +
+  scale_y_continuous(
+    labels = label_number(suffix = " M", accuracy = 1),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  theme_custom +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray90", linewidth = 0.5),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "#006400", linewidth = 1.5),
+    legend.title = element_text(face = "bold"),
+    legend.margin = margin(8, 8, 8, 8),
+    axis.text.x = element_text(face = "bold", size = 10)
+  )
+p1
+```
+
+
+
+
+## Taux de PSAP par année de survenance.
+
+```{r}
+provisions_df$var <- "Taux~de~PSAP~par~année~de~survenance"
+
+# ==================== OPTION 1 AMÉLIORÉE ====================
+# Graphique en barres avec dégradé + ligne de moyenne
+taux_moyen <- mean(provisions_df$Taux_PSAP, na.rm = TRUE)
+
+p2=ggplot(provisions_df, aes(x = as.factor(origin), y = Taux_PSAP, fill = Taux_PSAP)) +
+  geom_bar(stat = "identity", width = 0.75, color = "black", linewidth = 0.3) +
+  geom_hline(yintercept = taux_moyen, 
+             linetype = "dashed", color = "red", linewidth = 1) +
+  geom_text(aes(label = paste0(round(Taux_PSAP * 100, 1), "%")),
+            vjust = -0.7, size = 4.5, fontface = "bold", color = "black") +
+  annotate("label", 
+           x = 1.5, y = taux_moyen, 
+           label = paste0("Moyenne: ", round(taux_moyen * 100, 1), "%"),
+           fill = "white", color = "red", fontface = "bold",
+           size = 3.5, label.padding = unit(0.4, "lines"),
+           label.size = 0.5) +
+  scale_fill_gradientn(
+    colors = c("#E8F5E9", "#A5D6A7", "#66BB6A", "#43A047", "#2E7D32", "#1B5E20"),
+    labels = percent_format(accuracy = 1),
+    name = "Niveau\nde taux",
+    guide = guide_colorbar(
+      barwidth = 1.5,
+      barheight = 12,
+      frame.colour = "black",
+      frame.linewidth = 1,
+      ticks.colour = "black"
+    )
+  ) +
+  facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Année de survenance",
+    y = "Taux de PSAP"
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 0.1),
+    expand = expansion(mult = c(0, 0.18)),
+    breaks = pretty_breaks(n = 6)
+  ) +
+  theme_custom +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray90", linewidth = 0.5),
+    legend.position = "right",
+    legend.background = element_rect(
+      fill = "white", 
+      color = "#006400", 
+      linewidth = 1.5
+    ),
+    legend.title = element_text(face = "bold", size = 11),
+    legend.margin = margin(8, 8, 8, 8),
+    axis.text.x = element_text(face = "bold", size = 10)
+  )
+p2
+```
+
+
+
+
+
+
+```{r}
+# Graphiques diagnostiques
+par(mfrow = c(2, 2))
+plot(modele_christofides$residuals, main = "Résidus du modèle Christophides")
+abline(h = 0, col = "red")
+qqnorm(modele_christofides$residuals)
+qqline(modele_christofides$residuals)
+#cat("p-value Ljung-Box :", round(lb_test$p.value, 4), "\n")
+```
+
+
+# Partie II: Estimation du risque de reserve avec la méthode sémi-analytique
+
+## 1-Variance stochastique
+
+```{r}
+## Christofides : Var(X_ij) = X_hat_ij^2 * (exp(sigma^2) - 1)
+## On ne somme que sur les cellules FUTURES (i,j futurs)
+## variance résiduelle sigma^2
+sigma2 <- summary(modele_christofides)$sigma^2
+## 3. Prédiction des cellules futures et Best Estimate 
+df_na <- subset(df, is.na(value))
+## mu_hat = prédiction de ln(X_ij) = alpha_i + beta_j
+mu_hat_future <- predict(modele_christofides, newdata = df_na)
+
+X_hat_future <- exp(mu_hat_future + 0.5 * sigma2)
+
+var_stoch_cell <- X_hat_future^2 * (exp(sigma2) - 1)
+
+df_var_stoch <- df_na_predict
+df_var_stoch$var_stoch <- var_stoch_cell
+
+var_stoch_origin <- df_var_stoch %>%
+  group_by(origin) %>%
+  summarise(var_stoch = sum(var_stoch, na.rm = TRUE))
+
+var_stoch_total <- sum(var_stoch_origin$var_stoch)
+sd_stoch_total  <- sqrt(var_stoch_total)
+
+var_stoch_total
+sd_stoch_total
+```
+
+
+##2-Variance d'estimation - méthode Delta 
+
+```{r}
+## V_beta = Var(theta_hat), matrice de covariance des coefficients du LM
+V_beta <- vcov(modele_christofides)
+
+## Matrice de design pour les cellules futures
+X_new  <- model.matrix(~ origin + dev, data = df_na_predict)
+
+## Var(mu_hat_future) = diag( X_new %*% V_beta %*% t(X_new) )
+var_mu <- diag(X_new %*% V_beta %*% t(X_new))
+
+## m_ij = E[X_ij] = exp(mu_hat + 1/2 * sigma^2)
+m_ij <- X_hat_future
+
+## par Delta : Var_est(X_ij) ??? (dX/dmu)^2 Var(mu) = m_ij^2 * Var(mu)
+var_estim_cell <- (m_ij^2) * var_mu
+
+df_var_estim <- df_na_predict
+df_var_estim$var_estim <- var_estim_cell
+
+var_estim_origin <- df_var_estim %>%
+  group_by(origin) %>%
+  summarise(var_estim = sum(var_estim, na.rm = TRUE))
+
+var_delta_estimation <- sum(var_estim_origin$var_estim)
+sd_estim_total  <- sqrt(var_delta_estimation)
+
+var_delta_estimation
+sd_estim_total
+
+```
+
+##3-Variance d'estimation - Bootstrap 
+
+### Un premier test.
+
+```{r}
+library(dplyr)
+set.seed(123)
+
+#assurer que origin/dev en NUMERIQUE dans df
+
+df <- df %>%
+  mutate(
+    origin_num = suppressWarnings(as.numeric(as.character(origin))),
+    dev_num    = suppressWarnings(as.numeric(as.character(dev)))
+  )
+
+
+
+n <- df %>%
+  filter(!is.na(value)) %>%
+  mutate(diag = origin_num + dev_num) %>%
+  summarise(n = max(diag, na.rm = TRUE)) %>%
+  pull(n)
+
+
+# Cellules futures
+
+df_future <- df %>%
+  filter(origin_num + dev_num > n)
+
+
+# Données observées 
+
+df_obs <- df %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    log_value = log(value),
+    origin_f  = factor(origin_num),
+    dev_f     = factor(dev_num)
+  )
+
+# IMPORTANT : mettre les mêmes niveaux dans df_future
+df_future <- df_future %>%
+  mutate(
+    origin_f = factor(origin_num, levels = levels(df_obs$origin_f)),
+    dev_f    = factor(dev_num,    levels = levels(df_obs$dev_f))
+  )
+
+
+#  Modèle initial (Christofides log-normal)
+
+model <- lm(log_value ~ origin_f + dev_f, data = df_obs)
+sigma2_hat <- summary(model)$sigma^2
+
+eta_hat <- predict(model, newdata = df_obs)
+mu_hat  <- exp(eta_hat + 0.5 * sigma2_hat)
+var_hat <- mu_hat^2 * (exp(sigma2_hat) - 1)
+sd_hat  <- sqrt(var_hat)
+
+# Résidus de Pearson
+resid_pearson <- (df_obs$value - mu_hat) / sd_hat
+
+
+# Bootstrap
+
+B <- 1
+R_boot<- numeric(B)
+
+idx_obs <- which(!is.na(df$value))  # cellules observées dans df "large"
+
+for (b in seq_len(B)) {
+
+  r_star <- sample(resid_pearson, size = length(resid_pearson), replace = TRUE)
+
+  X_star <- mu_hat + r_star * sd_hat
+  X_star <- pmax(X_star, 1e-8)
+
+  df_star <- df
+  df_star$value[idx_obs] <- X_star
+  df_star$log_value <- log(df_star$value)
+
+  df_star_obs <- df_star %>%
+    filter(!is.na(value)) %>%
+    mutate(
+      origin_f = factor(origin_num),  # refait les facteurs
+      dev_f    = factor(dev_num)
+    )
+
+  # assurer que df_future a les bons niveaux pour CE modèle bootstrap
+  df_star_future <- df_star %>%
+    filter(origin_num + dev_num > n) %>%
+    mutate(
+      origin_f = factor(origin_num, levels = levels(df_star_obs$origin_f)),
+      dev_f    = factor(dev_num,    levels = levels(df_star_obs$dev_f))
+    )
+
+  model_star  <- lm(log_value ~ origin_f + dev_f, data = df_star_obs)
+  sigma2_star <- summary(model_star)$sigma^2
+
+  eta_future <- predict(model_star, newdata = df_star_future)
+  mu_future  <- exp(eta_future + 0.5 * sigma2_star)
+
+  R_boot[b] <- sum(mu_future, na.rm = TRUE)
+}
+
+
+ #Résultats bootstrap
+
+var_boot <- var(R_boot)
+sd_boot  <- sd(R_boot)
+
+cat("n (dernière diagonale) :", n, "\n")
+cat("Nb cellules futures :", nrow(df_future), "\n")
+cat("Variance bootstrap (erreur d’estimation) :", var_boot, "\n")
+cat("Écart-type bootstrap :", sd_boot, "\n")
+cat("Moyenne bootstrap :", mean(R_boot), "\n")
+
+```
+
+# sensi bootstrap (à faire)
+#------------------------------------------
+
+
+```{r}
+B_grid <- c(50, 100, 200, 500, 1000, 2000, 5000,10000,20000,30000)
+#B_grid <- 1:10000
+
+```
+
+
+```{r}
+bootstrap_reserve <- function(B) {
+  set.seed(123)
+  R_boot <- numeric(B)
+
+  for (b in seq_len(B)) {
+
+    r_star <- sample(resid_pearson, length(resid_pearson), replace = TRUE)
+
+    X_star <- mu_hat + r_star * sd_hat
+    X_star <- pmax(X_star, 1e-8)
+
+    df_star <- df
+    df_star$value[idx_obs] <- X_star
+    df_star$log_value <- log(df_star$value)
+
+    df_star_obs <- df_star %>%
+      filter(!is.na(value)) %>%
+      mutate(
+        origin_f = factor(origin_num, levels = levels(df_obs$origin_f)),
+        dev_f    = factor(dev_num,    levels = levels(df_obs$dev_f))
+      )
+
+    df_star_future <- df_star %>%
+      filter(origin_num + dev_num > n) %>%
+      mutate(
+        origin_f = factor(origin_num, levels = levels(df_star_obs$origin_f)),
+        dev_f    = factor(dev_num,    levels = levels(df_star_obs$dev_f))
+      )
+
+    model_star  <- lm(log_value ~ origin_f + dev_f, data = df_star_obs)
+    sigma2_star <- summary(model_star)$sigma^2
+
+    eta_future <- predict(model_star, newdata = df_star_future)
+    mu_future  <- exp(eta_future + 0.5 * sigma2_star)
+
+    R_boot[b] <- sum(mu_future, na.rm = TRUE)
+  }
+
+  c(
+    mean = mean(R_boot),
+    sd   = sd(R_boot),
+    IC_inf  = quantile(R_boot, 0.125),
+    Q75  = quantile(R_boot, 0.75),
+    IC_sup  = quantile(R_boot, 0.825)
+  )
+}
+
+```
+
+
+#----------------------------------------
+
+
+```{r}
+results <- t(sapply(B_grid, bootstrap_reserve))
+results <- as.data.frame(results)
+results$B <- B_grid
+colnames(results)
+```
+
+
+
+
+### Méthode de la coude
+```{r}
+results$var <- "Méthode~du~coude~pour~le~choix~de~B"
+ggplot(results, aes(x = B, y = sd)) +
+  geom_line() +
+  geom_point() +
+  scale_x_log10() +facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Nombre de réplications bootstrap (B)",
+    y = "Écart-type de la réserve"
+  ) +
+  theme_custom
+```
+
+
+```{r}
+
+results$var <- "Méthode~du~coude~pour~le~choix~de~B"
+
+ggplot(results, aes(x = B, y = sd)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(
+    xintercept = 10000,
+    colour = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_x_log10() +
+  facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Nombre de réplications bootstrap (B)",
+    y = "Écart-type de la réserve"
+  ) +
+  theme_custom
+
+```
+
+
+
+
+```{r}
+results <- results %>%
+  arrange(B) %>%
+  mutate(
+    rel_change = abs(sd - lag(sd)) / lag(sd)
+  )
+results
+```
+
+```{r}
+results$var <- "Méthode~du~coude~pour~le~choix~de~B"
+ggplot(results, aes(x = B, y = rel_change)) +
+  geom_line() +
+  geom_point() +
+  scale_x_log10() +facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Nombre de réplications bootstrap (B)",
+    y = "Variation relative de l'écart type"
+  ) +
+  theme_custom
+```
+
+
+```{r}
+results$var <- "Méthode~du~coude~pour~le~choix~de~B"
+
+ggplot(results, aes(x = B, y = rel_change)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(
+    xintercept = 10000,
+    colour = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_x_log10() +
+  facet_grid(~var, labeller = label_parsed) +
+  labs(
+    x = "Nombre de réplications bootstrap (B)",
+    y = "Variation relative de l'écart type"
+  ) +
+  theme_custom
+
+```
+
+
+
+```{r}
+library(ggplot2)
+
+results$var <-"Méthode~du~coude~globale~avec~moyenne~PSAP+~quantiles~et~IC~0.75"
+
+ggplot(results, aes(x = B)) +
+
+  # IC 75 %
+  geom_ribbon(
+    aes(
+      ymin = `IC_inf.12.5%`,
+      ymax = `IC_sup.82.5%`,
+      fill = "IC 75 %"
+    ),
+    alpha = 0.35
+  ) +
+
+  # Moyenne
+  geom_line(
+    aes(y = mean, colour = "Moyenne"),
+    linewidth = 1
+  ) +
+  geom_point(
+    aes(y = mean, colour = "Moyenne"),
+    size = 2
+  ) +
+
+  # Quantile 75 %
+  geom_line(
+    aes(y = `Q75.75%`, colour = "Quantile 75 %"),
+    linewidth = 1,
+    linetype = "dashed"
+  ) +
+
+  # Ligne verticale B choisi
+  geom_vline(
+    aes(xintercept = 10000, linetype = "B retenu"),
+    colour = "red",
+    linewidth = 1
+  ) +
+
+  scale_x_log10() +
+  facet_grid(~var, labeller = label_parsed) +
+
+  # Échelles pour la légende
+  scale_colour_manual(
+    name = "",
+    values = c(
+      "Moyenne" = "black",
+      "Quantile 75 %" = "blue"
+    )
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = c(
+      "IC 75 %" = "grey70"
+    )
+  ) +
+  scale_linetype_manual(
+    name = "",
+    values = c(
+      "B retenu" = "dotted"
+    )
+  ) +
+
+  labs(
+    x = "Nombre de réplications bootstrap (B)",
+    y = "Réserve estimée",
+  ) +
+
+  theme_custom +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+```
+
+
+on choisit B=10000 
+
+#----------------------------------------
+
+
+```{r}
+origins <- sort(unique(df_future$origin_num))
+n_origin <- length(origins)
+B <- 10000
+R_boot_origin <- matrix(
+  NA_real_,
+  nrow = B,
+  ncol = n_origin,
+  dimnames = list(NULL, origins)
+)
+```
+
+
+
+
+```{r}
+set.seed(123)
+
+for (b in seq_len(B)) {
+
+  r_star <- sample(resid_pearson, length(resid_pearson), replace = TRUE)
+
+  X_star <- mu_hat + r_star * sd_hat
+  X_star <- pmax(X_star, 1e-8)
+
+  df_star <- df
+  df_star$value[idx_obs] <- X_star
+  df_star$log_value <- log(df_star$value)
+
+  df_star_obs <- df_star %>%
+    filter(!is.na(value)) %>%
+    mutate(
+      origin_f = factor(origin_num, levels = levels(df_obs$origin_f)),
+      dev_f    = factor(dev_num,    levels = levels(df_obs$dev_f))
+    )
+
+  df_star_future <- df_star %>%
+    filter(origin_num + dev_num > n) %>%
+    mutate(
+      origin_f = factor(origin_num, levels = levels(df_star_obs$origin_f)),
+      dev_f    = factor(dev_num,    levels = levels(df_star_obs$dev_f))
+    )
+
+  model_star  <- lm(log_value ~ origin_f + dev_f, data = df_star_obs)
+  sigma2_star <- summary(model_star)$sigma^2
+
+  df_star_future$mu_future <- exp(
+    predict(model_star, newdata = df_star_future) + 0.5 * sigma2_star
+  )
+
+  # 🔹 Réserve PAR année d'origine
+  R_by_origin <- df_star_future %>%
+    group_by(origin_num) %>%
+    summarise(reserve = sum(mu_future), .groups = "drop")
+
+  R_boot_origin[b, as.character(R_by_origin$origin_num)] <-
+    R_by_origin$reserve
+}
+
+```
+
+
+###
+
+```{r}
+R_boot_total<- rowSums(R_boot_origin, na.rm = TRUE)
+
+# Réserve totale = somme des origines
+all.equal(
+  rowSums(R_boot_origin, na.rm = TRUE),
+  R_boot_total,
+  tolerance = 1e-6
+)
+
+```
+
+#### GLOBAL
+
+
+```{r}
+mean_R <- mean(R_boot_total)
+Q75_R  <- quantile(R_boot_total, 0.75)
+IC_R   <- quantile(R_boot_total, c(0.125, 0.875))
+var_boot_estimation <- var(R_boot_total)
+sd_boot_estimation <- sd(R_boot_total)
+```
+
+
+
+### Distribution des reserves
+
+```{r}
+# Version améliorée du graphique de densité bootstrap
+
+# Calcul préalable de la densité pour les annotations
+densite_R <- density(R_boot_total)
+
+df_R <- data.frame(R = R_boot_total)
+df_R$var <- "Distribution~bootstrap~de~la~réserve~totale"
+
+# Calculer les statistiques (si ce n'est pas déjà fait)
+mean_R <- mean(R_boot_total)
+Q75_R <- quantile(R_boot_total, 0.75)
+IC_R <- quantile(R_boot_total, c(0.125, 0.875))  # IC à 75%
+
+ggplot(df_R, aes(x = R)) +
+  
+  # 1. Aire de densité (fond)
+  geom_density(
+    aes(fill = "Densité"),
+    alpha = 0.3,
+    linewidth = 1,
+    color = "#006400"
+  ) +
+  
+  # 2. Zone de l'intervalle de confiance (fond coloré)
+  geom_area(
+    data = data.frame(
+      x = seq(IC_R[1], IC_R[2], length.out = 100),
+      y = approx(densite_R$x, densite_R$y, 
+                 seq(IC_R[1], IC_R[2], length.out = 100))$y
+    ),
+    aes(x = x, y = y, fill = "IC 75%"),
+    alpha = 0.2
+  ) +
+  
+  # 3. Ligne de densité (par-dessus)
+  geom_density(
+    linewidth = 1,
+    color = "#006400",
+    show.legend = FALSE
+  ) +
+  
+  facet_grid(~var, labeller = label_parsed) +
+  
+  # 4. Lignes verticales avec ordre d'affichage contrôlé
+  # IC 75 % d'abord (en arrière-plan)
+  geom_vline(
+    aes(xintercept = IC_R[1]),
+    color = "red",
+    linewidth = 0.8,
+    linetype = "dashed",
+    alpha = 0.7
+  ) +
+  geom_vline(
+    aes(xintercept = IC_R[2]),
+    color = "red",
+    linewidth = 0.8,
+    linetype = "dashed",
+    alpha = 0.7
+  ) +
+  
+  # Moyenne
+  geom_vline(
+    aes(xintercept = mean_R, color = "Moyenne (BE)"),
+    linewidth = 1.2
+  ) +
+  
+  # Quantile 75 %
+  geom_vline(
+    aes(xintercept = Q75_R, color = "Quantile 75%"),
+    linewidth = 1.2,
+    linetype = "dashed"
+  ) +
+  
+  # 5. Annotations textuelles améliorées
+  annotate("text",
+           x = mean_R,
+           y = max(densite_R$y) * 0.95,
+           label = paste0("BE = ", round(mean_R/1e6, 2), " M€"),
+           color = "black",
+           hjust = -0.1,
+           vjust = 0,
+           size = 3.5,
+           fontface = "bold") +
+  
+  annotate("text",
+           x = Q75_R,
+           y = max(densite_R$y) * 0.85,
+           label = paste0("Q75 = ", round(Q75_R/1e6, 2), " M€"),
+           color = "blue",
+           hjust = -0.1,
+           vjust = 0,
+           size = 3.5) +
+  
+  # Annotation pour l'IC (au centre)
+  annotate("text",
+           x = mean(IC_R),
+           y = max(densite_R$y) * 0.75,
+           label = paste0("IC 75% = [", round(IC_R[1]/1e6, 2), ", ", 
+                          round(IC_R[2]/1e6, 2), "] M€"),
+           color = "red",
+           size = 3.5) +
+  
+  # 6. Flèches pour l'IC
+  annotate("segment",
+           x = IC_R[1], xend = IC_R[2],
+           y = max(densite_R$y) * 0.1,
+           yend = max(densite_R$y) * 0.1,
+           arrow = arrow(ends = "both", angle = 90, length = unit(0.1, "inches")),
+           color = "red",
+           linewidth = 0.7) +
+  
+  # 7. Échelles et légendes
+  scale_fill_manual(
+    name = "",
+    values = c("Densité" = "#00640020", "IC 75%" = "red"),
+    guide = guide_legend(order = 1)
+  ) +
+  
+  scale_color_manual(
+    name = "",
+    values = c(
+      "Moyenne (BE)" = "black",
+      "Quantile 75%" = "blue"
+    ),
+    guide = guide_legend(order = 2)
+  ) +
+  
+  # 8. Labels
+  labs(
+    x = "Réserve totale (en M€)",
+    y = "Densité"
+  ) +
+  
+  # 9. Format de l'axe X en millions
+  scale_x_continuous(
+    labels = function(x) paste0(round(x/1e6, 1), " M€")
+  ) +
+  
+  # 10. Thème personnalisé
+  theme_custom +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.margin = margin(t = -5, b = 5),
+    legend.spacing = unit(0.5, "cm"),
+    legend.key.size = unit(0.8, "lines")
+  ) +
+  
+  # 11. Gestion de l'ordre des légendes
+  guides(
+    fill = guide_legend(override.aes = list(alpha = c(0.3, 0.2))),
+    color = guide_legend(override.aes = list(
+      linetype = c("solid", "dashed"),
+      linewidth = c(1.2, 1.2)
+    ))
+  )
+```
+
+
+
+
+### Resultats bootstrap par année d'origine ou de survenance
+
+```{r}
+results_origin <- data.frame(
+  origin = origins,
+  mean   = colMeans(R_boot_origin, na.rm = TRUE),
+  sd     = apply(R_boot_origin, 2, sd, na.rm = TRUE),
+  Q75    = apply(R_boot_origin, 2, quantile, 0.75, na.rm = TRUE),
+  q90    = apply(R_boot_origin, 2, quantile, 0.90, na.rm = TRUE),
+  q95    = apply(R_boot_origin, 2, quantile, 0.95, na.rm = TRUE),
+  q99    = apply(R_boot_origin, 2, quantile, 0.99, na.rm = TRUE),
+  IC_inf = apply(R_boot_origin, 2, quantile, 0.125, na.rm = TRUE),
+  IC_sup = apply(R_boot_origin, 2, quantile, 0.875, na.rm = TRUE)
+)
+results_origin
+```
+
+
+
+### Représentation graphique des résultats
+
+```{r}
+# Ajouter la colonne pour le titre du graphique
+results_origin$titre <- "Intervalle de Confiance Bootstrap à 75% par Année de Survenance"
+
+ggplot(results_origin) +
+  # 1. Zone de confiance 75% (doit être le premier élément pour être en arrière-plan)
+  geom_ribbon(aes(x = origin, ymin = IC_inf, ymax = IC_sup),
+              fill = "lightgreen", alpha = 0.3, show.legend = FALSE) +
+  
+  # 2. Ligne de la moyenne
+  geom_line(aes(x = origin, y = mean, color = "Best Estimate"),
+            linewidth = 1.2) +
+  
+  # 3. Points de la moyenne
+  geom_point(aes(x = origin, y = mean, color = "Best Estimate"),
+             size = 3) +
+  
+  # 4. Ligne du quantile 75%
+  geom_line(aes(x = origin, y = Q75, color = "Quantile 75%"),
+            linewidth = 1, linetype = "dashed") +
+  
+  # 5. Points du quantile 75%
+  geom_point(aes(x = origin, y = Q75, color = "Quantile 75%"),
+             size = 3, shape = 17) +
+  
+  # 6. Facet avec titre (sans labeller parsed car ce n'est pas une formule)
+  facet_wrap(~titre) +
+  
+  # 7. Échelle X discrète
+  scale_x_continuous(
+    breaks = results_origin$origin,
+    name = "Année de survenance"
+  ) +
+  
+  # 8. Échelle Y
+  scale_y_continuous(
+    name = "Montant (€)",
+    labels = scales::label_number(scale = 1e-6, suffix = " M") # Format millions
+  ) +
+  
+  # 9. Couleurs pour la légende
+  scale_color_manual(
+    name = "",
+    values = c("Best Estimate" = "blue", "Quantile 75%" = "orange"),
+    breaks = c("Best Estimate", "Quantile 75%")
+  ) +
+  
+  # 10. Appliquer le thème personnalisé
+  theme_custom +
+  
+  # 11. Ajustements supplémentaires pour la légende
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.margin = margin(t = -10),
+    legend.text = element_text(size = 10)
+  )
+```
+
+
+# MSEP
+
+```{r}
+## 8. MSEP et quantile 75 % 
+## a) MSEP avec l'erreur d'estimation Delta
+MSEP_Delta <- var_stoch_total + var_delta_estimation
+sd_Delta<- sqrt(MSEP_Delta)
+
+z_75 <- qnorm(0.75) # ??? 0.674
+z_0_125 <- qnorm(0.125)
+z_0_875 <- qnorm(0.875)
+Q75_delta  <- BE_total + z_75 * sd_Delta
+
+IC_inf_delta=BE_total + z_0_125* sd_Delta
+IC_sup_delta =BE_total + z_0_875* sd_Delta
+
+MSEP_Delta
+sd_Delta
+Q75_delta
+```
+
+
+```{r}
+mean_R <- mean(R_boot_total)
+Q75_R  <- quantile(R_boot_total, 0.75)
+IC_R   <- quantile(R_boot_total, c(0.125, 0.875))
+var_boot_estimation <- var(R_boot_total)
+sd_boot_estimation <- sd(R_boot_total)
+```
+
+
+
+```{r}
+
+## b) Variante : MSEP avec l'erreur d'estimation bootstrap
+MSEP_boot <- var_stoch_total + var_boot_estimation
+sd_boot   <- sqrt(MSEP_boot)
+Q75_boot  <- quantile(R_boot_total, 0.75)# F
+
+MSEP_boot
+sd_boot
+Q75_boot
+```
+
+
+
+
+
+
+### 
+
+
+```{r}
+Variance_process=c(var_stoch_total,var_stoch_total)
+Variance_estimation=c(var_delta_estimation,var_boot_estimation)
+MSEP=c(MSEP_Delta,MSEP_boot)
+RACINE_MSEP=sqrt(MSEP)
+Quantile_75=c(Q75_delta,Q75_boot[[1]])
+IC_INF=c(IC_inf_delta,IC_R[1])
+IC_SUP=c(IC_sup_delta,IC_R[2])
+
+
+```
+
+
+```{r}
+df_resultats_christo <- data.frame(
+  Delta = c(
+    var_stoch_total,
+    var_delta_estimation,
+    MSEP_Delta,
+    RACINE_MSEP[1],
+    Q75_delta,
+    IC_inf_delta,
+    IC_sup_delta
+  ),
+  Bootstrap = c(
+    var_stoch_total,
+    var_boot_estimation,
+    MSEP_boot,
+    RACINE_MSEP[2],
+    Q75_boot[[1]],
+    IC_R[1],
+    IC_R[2]
+  ),
+  row.names = c(
+    "Variance_process",
+    "Variance_estimation",
+    "MSEP",
+    "RACINE_MSEP",
+    "Quantile_75",
+    "IC_INF",
+    "IC_SUP"
+  )
+)
+df_resultats_christo
+```
+
+
+
+```{r}
+df_format <- df_resultats_christo
+df_format[] <- lapply(df_format, function(x) format(x, big.mark = " ", scientific = FALSE))
+df_format
+```
+
+
+
+## Comparaison avec les autres méthod
+
+
+```{r}
+
+
+library(ChainLadder)
+
+scalarize <- function(x) {
+  x_num <- as.numeric(x)
+  if (length(x_num) == 0L) return(NA_real_)
+  x_num[1]
+}
+get_totals_col <- function(mat) {
+  if (is.null(mat)) return(1)
+  cn <- colnames(mat)
+  if (!is.null(cn)) {
+    idx <- which(tolower(cn) %in% c("totals", "total"))
+    if (length(idx) > 0) return(idx[1])
+  }
+  1
+}
+
+# ----------------------------
+# quantiles z
+# ----------------------------
+z_75  <- qnorm(0.75)
+z_975 <- qnorm(0.975)
+
+# ==========================================================
+# 1) CHRISTOFIDES LOG-NORMALE 
+# ==========================================================
+PSAP_Christo   <- scalarize(BE_total)
+MSEP_boot_Christo    <- scalarize(MSEP_Delta)
+MSEP_boot_Christo  <- scalarize(MSEP_boot)
+Q75_Christo    <- scalarize(Q75_boot)
+IC_inf_Christo <- scalarize(IC_R[1])
+IC_sup_Christo <- scalarize(IC_R[2])
+
+# ==========================================================
+# 2) MACK CHAIN-LADDER (Delta + Bootstrap) 
+# ==========================================================
+tri_cum <- mon_triangle
+mack_fit <- MackChainLadder(tri_cum, est.sigma = "Mack")
+mack_sum <- summary(mack_fit)
+col_tot <- get_totals_col(mack_sum$Totals)
+PSAP_Mack     <- scalarize(mack_sum$Totals[4, col_tot])  # IBNR total
+sd_Mack_Delta <- scalarize(mack_sum$Totals[5, col_tot])  # Mack.S.E total
+MSEP1_Mack    <- sd_Mack_Delta^2
+
+
+
+# --- Bootstrap Mack : on utilise la distribution simul?e de l'IBNR total
+set.seed(123)
+boot_Mack <- BootChainLadder(tri_cum, R = 100000, process.distr = "gamma")
+
+# IBNR total par simulation (robuste)
+if (!is.null(boot_Mack$IBNR.Totals)) {
+  R_boot_total_Mack <- as.numeric(boot_Mack$IBNR.Totals)
+} else if (!is.null(boot_Mack$Totals) && "IBNR" %in% colnames(boot_Mack$Totals)) {
+  R_boot_total_Mack <- as.numeric(boot_Mack$Totals[, "IBNR"])
+} else if (!is.null(boot_Mack$IBNR)) {
+  # si boot_Mack$IBNR est une matrice (R x origines) ou (origines x R)
+  ib <- boot_Mack$IBNR
+  if (is.matrix(ib)) {
+    if (nrow(ib) == 100000 || nrow(ib) == 1000) {
+      R_boot_total_Mack <- as.numeric(rowSums(ib, na.rm = TRUE))
+    } else {
+      R_boot_total_Mack <- as.numeric(colSums(ib, na.rm = TRUE))
+    }
+  } else {
+    R_boot_total_Mack <- as.numeric(ib)
+  }
+} else {
+  stop("Impossible de récupérer les simulations bootstrap Mack (IBNR totals).")
+}
+
+sd_Mack_boot <- sd(R_boot_total_Mack, na.rm = TRUE)
+MSEP2_Mack   <- sd_Mack_boot^2
+
+# --- Q75 et IC Mack "comme avant" : par quantiles empiriques (pas formule PSAP+z*sd)
+Q75_R_Mack <- quantile(R_boot_total_Mack, 0.75, na.rm = TRUE)
+IC_R_Mack  <- quantile(R_boot_total_Mack, c(0.125, 0.875), na.rm = TRUE)
+
+
+# ==========================================================
+# 4) TABLEAU FINAL
+# ==========================================================
+results<-data.frame(
+  Methode = c("Christofides Log-Normale",
+              "Mack Chain-Ladder"),
+  PSAP = c(PSAP_Christo, PSAP_Mack),
+  MSEP_delta = c(MSEP_boot_Christo  , MSEP1_Mack),
+  MSEP_bootstrap = c(MSEP2_Christo, MSEP2_Mack),
+  Quantile_75 = c(Q75_Christo, Q75_R_Mack),
+  IC_inf = c(IC_inf_Christo, IC_R_Mack[1]),
+  IC_sup = c(IC_sup_Christo, IC_R_Mack[2])
+)
+
+print(results, row.names = FALSE)
+
+
+
+```
+
+
+
+```{r}
+# ==========================================================
+# 5) petit diagnostic utile
+# ==========================================================
+cat("\n--- Diagnostic Mack Totals (pour v?rifier indices) ---\n")
+print(mack_sum$Totals)
+cat("\n--- R?sum? percent_reported (BF) ---\n")
+print(summary(percent_reported))
+```
+``
+
+
+
+
+
+# Présentation graphique
+
+```{r}
+
+
+resultats_reserve=results
+resultats_reserve$var <- "Intervalle~de~Confiance~Bootstrap~à~0.75~par~Année~de~Survenance"
+ggplot(resultats_reserve,
+       aes(x = Methode, y = PSAP)) +
+  geom_point(size = 3, color = "#1f78b4") +
+  geom_errorbar(
+    aes(ymin = IC_inf, ymax = IC_sup),
+    width = 0.15,
+    color = "#1f78b4"
+  ) +
+  theme_custom + 
+  facet_grid(~var, labeller = label_parsed) +
+  geom_point(
+    aes(y = Quantile_75),
+    shape = 18,
+    size = 4,
+    color = "#e31a1c"
+  ) +
+  labs(
+    #subtitle = "PSAP, quantile 75 % et intervalles de confiance",
+    x = "Méthode",
+    y = "Montant de réserve",
+    caption = "● PSAP  |  ◆ Quantile 75 %  |  Barres : IC"
+  )+
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+
+```
+
+
+```{r}
+# Ajouter la colonne pour le titre du graphique
+results_origin$titre <- "Intervalle de Confiance Bootstrap à 75% par Année de Survenance"
+
+ggplot(
+  results_origin,
+  aes(x = origin)
+) +
+  # 1. Zone de confiance 75% (arrière-plan)
+  geom_ribbon(
+    aes(ymin = IC_inf, ymax = IC_sup),
+    fill = "lightgreen",
+    alpha = 0.3,
+    show.legend = FALSE
+  ) +
+  
+  # 2. Ligne Best Estimate
+  geom_line(
+    aes(y = mean, color = "Best Estimate"),
+    linewidth = 1.2
+  ) +
+  
+  # 3. Points Best Estimate
+  geom_point(
+    aes(y = mean, color = "Best Estimate"),
+    size = 3
+  ) +
+  
+  # 4. Ligne Quantile 75%
+  geom_line(
+    aes(y = Q75, color = "Quantile 75%"),
+    linewidth = 1,
+    linetype = "dashed"
+  ) +
+  
+  # 5. Points Quantile 75%
+  geom_point(
+    aes(y = Q75, color = "Quantile 75%"),
+    size = 3,
+    shape = 17
+  ) +
+  
+  # 6. Facet pour afficher le titre
+  facet_wrap(~ titre) +
+  
+  # 7. Axe X
+  scale_x_continuous(
+    breaks = sort(unique(results_origin$origin)),
+    name = "Année de survenance"
+  ) +
+  
+  # 8. Axe Y (en millions)
+  scale_y_continuous(
+    name = "Montant (€)",
+    labels = scales::label_number(scale = 1e-6, suffix = " M")
+  ) +
+  
+  # 9. Légende
+  scale_color_manual(
+    name = "",
+    values = c(
+      "Best Estimate" = "blue",
+      "Quantile 75%"  = "orange"
+    ),
+    breaks = c("Best Estimate", "Quantile 75%")
+  ) +
+  
+  # 10. Thème personnalisé
+  theme_custom +
+  
+  # 11. Ajustements de la légende
+  theme(
+    legend.position = "right",
+    legend.box = "horizontal",
+    legend.margin = margin(t = -10),
+    legend.text = element_text(size = 10)
+  )
+
+```
+
+
+
+
+
+```{r}
+# Harmonisation
+resultats_reserve <- results
+
+# Titre parsé pour facet
+resultats_reserve$var <- 
+  "Intervalle~de~Confiance~Bootstrap~à~0.75~par~Année~de~Survenance"
+
+ggplot(
+  resultats_reserve,
+  aes(x = Methode, y = PSAP)
+) +
+  # 1. Barres d’intervalle de confiance (hors légende)
+  geom_errorbar(
+    aes(ymin = IC_inf, ymax = IC_sup),
+    width = 0.15,
+    color = "#060",
+    show.legend = TRUE
+  ) +
+  
+  # 2. Point PSAP (avec légende)
+  geom_point(
+    aes(color = "PSAP"),
+    size = 3
+  ) +
+  
+  # 3. Point Quantile 75 % (avec légende)
+  geom_point(
+    aes(y = Quantile_75, color = "Quantile 75 %"),
+    shape = 18,
+    size = 4
+  ) +
+  
+  # 4. Facet avec titre
+  facet_grid(~ var, labeller = label_parsed) +
+  
+  # 5. Labels
+  labs(
+    x = "Méthode",
+    y = "Montant de réserve",
+  ) +
+  
+  # 6. Légende manuelle (couleurs respectées)
+  scale_color_manual(
+    values = c(
+      "PSAP" = "#1f78b4",
+      "Quantile 75 %" = "#e31a1c",
+      "IC %" = "#060"
+    ),
+    breaks = c("PSAP", "Quantile 75 %")
+  ) +
+  
+  # 7. Thème personnalisé
+  theme_custom +
+  
+  # 8. Placement de la légende
+  theme(
+    legend.position = "right",
+    legend.box = "horizontal",
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+df_R <- data.frame(R = R_boot_total)
+df_R$var <- "Distribution~bootstrap~de~la~réserve~totale"
+
+# Densité pour positionner les annotations
+dens <- density(R_boot_total)
+
+ggplot(df_R, aes(x = R)) +
+
+  # Aire de densité
+  geom_density(
+    aes(fill = "Densité"),
+    alpha = 0.4,
+    linewidth = 1,
+    colour = "#006400"
+  ) +
+
+  # Facet avec titre parsé
+  facet_grid(~ var, labeller = label_parsed) +
+
+  # Moyenne (Best Estimate)
+  geom_vline(
+    aes(xintercept = mean_R, colour = "Moyenne"),
+    linewidth = 1.2
+  ) +
+
+  # Quantile 75 %
+  geom_vline(
+    aes(xintercept = Q75_R, colour = "Quantile 75 %"),
+    linewidth = 1.2,
+    linetype = "dashed"
+  ) +
+
+  # IC 75 %
+  geom_vline(
+    aes(xintercept = IC_75[1], colour = "IC 75 %"),
+    linewidth = 1,
+    linetype = "dotted"
+  ) +
+  geom_vline(
+    aes(xintercept = IC_75[2], colour = "IC 75 %"),
+    linewidth = 1,
+    linetype = "dotted"
+  ) +
+
+  # Légendes
+  scale_fill_manual(
+    name = "",
+    values = c("Densité" = "grey70")
+  ) +
+  scale_colour_manual(
+    name = "",
+    values = c(
+      "Moyenne" = "black",
+      "Quantile 75 %" = "blue",
+      "IC 75 %" = "red"
+    )
+  ) +
+
+  # Axe X en millions d’euros
+  scale_x_continuous(
+    name = "Réserve totale (M€)",
+    labels = scales::label_number(scale = 1e-6, suffix = " M€")
+  ) +
+
+  # Axe Y = densité (sans unité)
+  labs(
+    y = "Densité"
+  ) +
+
+  # Annotations (cohérentes avec l’échelle)
+  annotate(
+    "text",
+    x = mean_R,
+    y = max(dens$y) * 0.9,
+    label = paste0("BE = ", round(mean_R / 1e6, 2), " M€"),
+    color = "black",
+    hjust = -0.1,
+    size = 4
+  ) +
+  
+  annotate(
+    "text",
+    x = Q75_R,
+    y = max(dens$y) * 0.8,
+    label = paste0("Q75 = ", round(Q75_R / 1e6, 2), " M€"),
+    color = "blue",
+    hjust = -0.1,
+    size = 4
+  ) +
+  
+  annotate(
+    "text",
+    x = mean(IC_75),
+    y = max(dens$y) * 0.7,
+    label = paste0(
+      "IC 75% = [",
+      round(IC_75[1] / 1e6, 2), ", ",
+      round(IC_75[2] / 1e6, 2), "] M€"
+    ),
+    color = "red",
+    size = 4
+  ) +
+
+  # Thème
+  theme_custom +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+```
+
+
+
+
+
+
+
+
+```{r}
+# Ordonner les méthodes par PSAP
+resultats_reserve$Methode <- reorder(
+  resultats_reserve$Methode,
+  resultats_reserve$PSAP
+)
+
+ggplot(
+  resultats_reserve,
+  aes(y = Methode, x = PSAP)
+) +
+  # 1. Intervalle de confiance
+  geom_errorbarh(
+    aes(xmin = IC_inf, xmax = IC_sup),
+    height = 0.25,
+    color = "#060"
+  ) +
+  
+  # 2. Point PSAP
+  geom_point(
+    aes(color = "PSAP"),
+    size = 3
+  ) +
+  
+  # 3. Point Quantile 75 %
+  geom_point(
+    aes(x = Quantile_75, color = "Quantile 75 %"),
+    shape = 18,
+    size = 4
+  ) +
+  
+  # 4. Facet titre
+  facet_grid(~ var, labeller = label_parsed) +
+  
+  # 5. Axes
+  scale_x_continuous(
+    name = "Montant de réserve",
+    labels = scales::label_number(scale = 1e-6, suffix = " M€")
+  ) +
+  ylab("Méthode") +
+  
+  # 6. Légende
+  scale_color_manual(
+    name = "",
+    values = c(
+      "PSAP" = "#1f78b4",
+      "Quantile 75 %" = "#e31a1c"
+    )
+  ) +
+  
+  # 7. Thème
+  theme_custom +
+  theme(
+    legend.position = "bottom"
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
